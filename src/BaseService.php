@@ -4,7 +4,6 @@ namespace LaravelAux;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Database\Eloquent\Builder;
 
 abstract class BaseService
 {
@@ -19,7 +18,7 @@ abstract class BaseService
     protected $request;
 
     /**
-     * @var Builder|array
+     * @var array
      */
     protected $result;
 
@@ -263,6 +262,11 @@ abstract class BaseService
 
     public function orderBy($value)
     {
+        // Validação de segurança: apenas permitir caracteres alfanuméricos, underscore e ponto
+        if (!preg_match('/^[a-zA-Z0-9_.]+$/', $value)) {
+            return; // Ignora valores suspeitos
+        }
+        
         if($this->request->get('ascending')){
             $this->result = $this->result->orderBy($value);
             return;
@@ -270,37 +274,77 @@ abstract class BaseService
 
         $this->result = $this->result->orderByDesc($value);
     }
-
-    /**
-     * Method to Order Rows by passed Columns
-     *
-     * @param array|string $value
-     */
+    
     private function orderByAsc($value): void
     {
-        if (is_array($value)) {
-            foreach ($value as $filter) {
-                $this->result = $this->result->orderBy($filter);
-            }
-            return;
-        }
-        $this->result = $this->result->orderBy($value);
+        $this->applyOrderBy($value, 'asc');
     }
 
-    /**
-     * Method to Order Rows by passed Columns
-     *
-     * @param array|string $value
-     */
     private function orderByDesc($value): void
+    {
+        $this->applyOrderBy($value, 'desc');
+    }
+
+    private function applyOrderBy($value, string $direction): void
     {
         if (is_array($value)) {
             foreach ($value as $filter) {
-                $this->result = $this->result->orderByDesc($filter);
+                $this->applyOrderBy($filter, $direction);
             }
             return;
         }
-        $this->result = $this->result->orderByDesc($value);
+
+        // Validação de segurança: apenas permitir caracteres alfanuméricos, underscore e ponto
+        if (!preg_match('/^[a-zA-Z0-9_.]+$/', $value)) {
+            return; // Ignora valores suspeitos
+        }
+
+        if (str_contains($value, '.')) {
+            $this->orderByRelationshipColumn($value, $direction);
+        } else {
+            $this->result = $this->result->orderBy($value, $direction);
+        }
+    }
+
+    private function orderByRelationshipColumn(string $column, string $direction = 'asc'): void
+    {
+        [$relationName, $relatedColumn] = explode('.', $column);
+
+        $model = $this->repository->getModel();
+
+        if (!method_exists($model, $relationName)) {
+            return; // ignora se a relação não existir
+        }
+
+        /** @var Relation $relation */
+        $relation = $model->$relationName();
+
+        $relatedTable = $relation->getRelated()->getTable();
+        $parentTable = $model->getTable();
+
+        // Detecta o tipo de relação para obter chaves corretamente
+        if (method_exists($relation, 'getQualifiedOwnerKeyName')) {
+            // belongsTo
+            $foreignKey = $relation->getQualifiedForeignKeyName(); // ex: tabela.foreign_key
+            $ownerKey = $relation->getQualifiedOwnerKeyName();     // ex: tabela.id
+        } elseif (method_exists($relation, 'getQualifiedForeignKeyName')) {
+            // hasOne / hasMany
+            $foreignKey = $relation->getQualifiedForeignKeyName();
+            $ownerKey = $relation->getQualifiedParentKeyName();
+        } else {
+            return; // ignora se não conseguir resolver
+        }
+
+        // Previne joins duplicados
+        $joinedTables = collect($this->result->getQuery()->joins ?? [])
+            ->pluck('table')
+            ->all();
+
+        if (!in_array($relatedTable, $joinedTables)) {
+            $this->result = $this->result->join($relatedTable, $foreignKey, '=', $ownerKey);
+        }
+
+        $this->result = $this->result->orderBy("$relatedTable.$relatedColumn", $direction);
     }
 
     /**
@@ -317,70 +361,36 @@ abstract class BaseService
     /**
      * Method to get Model Objects by passed Condition
      *
-     * @param string $key
-     * @param mixed $value
-     * @return void
+     * @param $key
+     * @param $value
      */
-    private function where(string $key, mixed $value): void
+    private function where($key, $value): void
     {
-        // Validar se a chave é uma coluna válida
-        if (!$this->isValidColumn($key)) {
-            return;
-        }
-
-        if (strpos($value, ',')) {
+        if(strpos($value, ',' )){
             $value = explode(',', $value);
         }
 
-        $this->result = $this->result->where(function (Builder $query) use ($key, $value) {
-            if ($encryptedProperties = $this->request->get('encrypted')) {
-                foreach ($encryptedProperties as $property) {
-                    if ($property === $key) {
-                        $query->whereEncrypted($key, 'like', '%' . $this->sanitizeValue($value) . '%');
-                        return;
+        $this->result = $this->result->where(function ($query) use ($key, $value) {
+
+            if($encryptedProperties = $this->request->get('encrypted')){
+                foreach($encryptedProperties as $property){
+                    if($property == $key){
+                        $query->whereEncrypted($key, 'LIKE', '%' . $value . '%');
+                            return;
                     }
                 }
             }
 
-            if (is_array($value)) {
-                $sanitizedValues = array_map([$this, 'sanitizeValue'], $value);
-                $query->whereIn($key, $sanitizedValues);
+            if (is_array($value)) {                
+                $query->whereIn($key, $value);
                 return;
             }
-
             if (is_numeric($value)) {
-                $query->where($key, (float) $value);
+                $query->where($key, $value);
             } else {
-                $query->where($key, 'like', '%' . $this->sanitizeValue($value) . '%');
+                $query->whereRaw("LOWER({$key}) LIKE LOWER(?)", '%' . $value . '%');
             }
         });
-    }
-
-    /**
-     * Method to get Model Objects by passed Condition
-     *
-     * @param mixed $value
-     * @return void
-     */
-    private function query(mixed $value): void
-    {
-        $columns = $this->repository->getFillable();
-        $sanitizedValue = $this->sanitizeValue($value);
-
-        foreach ($columns as $column) {
-            if (!$this->isValidColumn($column)) {
-                continue;
-            }
-
-            $type = Schema::getColumnType($this->repository->getTable(), $column);
-            if (!in_array($type, ['integer', 'boolean', 'decimal'])) {
-                $this->result = $this->result->orWhere($column, 'like', '%' . $sanitizedValue . '%');
-            } else {
-                if (is_numeric($value) || is_bool($value)) {
-                    $this->result = $this->result->orWhere($column, $value);
-                }
-            }
-        }
     }
 
     /**
@@ -414,6 +424,26 @@ abstract class BaseService
     }
 
     /**
+     * Method to get Model Objects by passed Condition
+     *
+     * @param $value
+     */
+    private function query($value): void
+    {
+        $columns = $this->repository->getFillable();
+        foreach ($columns as $column) {
+            $type = Schema::getColumnType($this->repository->getTable(), $column);
+            if (!in_array($type, ['integer', 'boolean', 'decimal'])) {
+                $this->result = $this->result->orWhereRaw("LOWER({$column}) LIKE LOWER(?)", '%' . $value . '%');
+            } else {
+                if (is_numeric($value) || is_bool($value)) {
+                    $this->result = $this->result->orWhere($column, $value);
+                }
+            }
+        }
+    }
+
+    /**
      * Method to Group Model Objects by passed column
      *
      * @param $column
@@ -426,58 +456,14 @@ abstract class BaseService
     /**
      * Method to Group Model Objects by passed column
      *
-     * @param string $value
-     * @return void
+     * @param $column
      */
-    private function whereInColumn(string $value): void
+    private function whereInColumn($value): void
     {
-        // Validar formato do input
-        if (!preg_match('/^[a-zA-Z0-9_]+\[[^\]]+\]$/', $value)) {
-            return;
-        }
-
         $string = explode('[', $value);
         $column = $string[0];
-        
-        // Validar se a coluna é válida
-        if (!$this->isValidColumn($column)) {
-            return;
-        }
-
         $value = substr($string[1], 0, -1);
-        $values = explode(',', $value);
-        
-        // Sanitizar valores
-        $sanitizedValues = array_map([$this, 'sanitizeValue'], $values);
-        
-        $this->result = $this->result->whereIn($column, $sanitizedValues);
-    }
-
-    /**
-     * Check if column exists and is valid
-     *
-     * @param string $column
-     * @return bool
-     */
-    private function isValidColumn(string $column): bool
-    {
-        return Schema::hasColumn($this->repository->getTable(), $column) &&
-               (in_array($column, $this->repository->getFillable()) || 
-                in_array($column, $this->repository->getGuarded()));
-    }
-
-    /**
-     * Sanitize value to prevent SQL injection
-     *
-     * @param mixed $value
-     * @return string
-     */
-    private function sanitizeValue(mixed $value): string
-    {
-        if (is_string($value)) {
-            // Remove caracteres especiais que podem ser usados para SQL injection
-            return preg_replace('/[^a-zA-Z0-9\s\-_.,]/', '', $value);
-        }
-        return (string) $value;
+        $value = explode(',', $value);
+        $this->result = $this->result->whereIn($column, $value);
     }
 }

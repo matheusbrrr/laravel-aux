@@ -5,8 +5,6 @@ namespace LaravelAux;
 use Exception;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Support\Facades\Schema;
 
 abstract class BaseRepository
 {
@@ -14,7 +12,7 @@ abstract class BaseRepository
      * @var Model
      */
     protected $model;
-
+    
     /**
      * BaseRepository constructor.
      *
@@ -33,6 +31,11 @@ abstract class BaseRepository
     public function all()
     {
         return $this->model->all();
+    }
+
+    public function getModel()
+    {
+        return $this->model;
     }
 
     /**
@@ -350,69 +353,41 @@ abstract class BaseRepository
     /**
      * Method to filter in Children Table - That method is valid only in Abstract Repository (withRelationIfExists)
      *
-     * @param Builder $query
-     * @param string $key
-     * @param mixed $value
-     * @param string|null $relation
-     * @return Builder
+     * @param $query
+     * @param $key
+     * @param $value
+     * @return mixed
      */
-    private function childrenWhere(Builder $query, string $key, mixed $value, ?string $relation = null): Builder
+    private function childrenWhere($query, $key, $value, $relation = null)
     {
-        // Validar se a chave é uma coluna válida
-        if (!in_array($key, $this->model->getFillable()) && !in_array($key, $this->model->getGuarded())) {
-            return $query;
-        }
-
         $query->where(function ($subquery) use ($query, $key, $value, $relation) {
             if (is_array($value)) {
                 foreach ($value as $column => $condition) {
-                    // Validar se a coluna é uma coluna válida
-                    if (!in_array($column, $this->model->getFillable()) && !in_array($column, $this->model->getGuarded())) {
-                        continue;
-                    }
-                    $subquery->where($key, 'like', '%' . $this->sanitizeValue($condition) . '%');
+                    $subquery->whereRaw("LOWER({$key}) LIKE LOWER(?)", '%' . $condition . '%');
                 }
                 return $query;
             }
 
-            if ($relation) {
-                try {
-                    $relationModel = $this->model->{$relation}();
-                    $relatedModel = $relationModel->getRelated();
-                    $tableName = $relatedModel->getTable();
+            if($relation){
 
-                    // Validar se a coluna existe na tabela relacionada
-                    if (!Schema::hasColumn($tableName, $key)) {
-                        return $query;
-                    }
+                try{
+                    $relationModel = $this->model->{$relation}(); // Returns a Relations subclass like BelongsTo or HasOne.
+                    $relatedModel = $relationModel->getRelated(); // Returns a new empty Model
+                    $tableName = $relatedModel->getTable();
 
                     $type = DB::connection()->getDoctrineColumn($tableName, $key)->getType()->getName();
 
-                    if (isset($type) && $type === 'integer') {
-                        $subquery->where($key, (int) $value);
-                    } else {
-                        $subquery->where($key, 'like', '%' . $this->sanitizeValue($value) . '%');
-                    }
-                } catch (Exception $e) {
-                    $subquery->where($key, 'like', '%' . $this->sanitizeValue($value) . '%');
+                } catch(Exception $e){
+                    $type = null;
+                }
+
+                if(isset($type) && $type == 'integer'){
+                    $subquery->where($key, $value);
+                } else {
+                    $subquery->whereRaw("LOWER({$key}) LIKE LOWER(?)", '%' . $value . '%');
                 }
             }
         });
         return $query;
-    }
-
-    /**
-     * Sanitize value to prevent SQL injection
-     *
-     * @param mixed $value
-     * @return string
-     */
-    private function sanitizeValue(mixed $value): string
-    {
-        if (is_string($value)) {
-            // Remove caracteres especiais que podem ser usados para SQL injection
-            return preg_replace('/[^a-zA-Z0-9\s\-_.,]/', '', $value);
-        }
-        return (string) $value;
     }
 }
